@@ -1,68 +1,90 @@
-import Dexie, { type Table } from 'dexie'
-import { StateSchema, createInitialState, type NotebookState } from './domain'
+import Dexie, { type Table } from 'dexie';
+import {
+  createInitialNotebook,
+  parseBackup,
+  validateNotebook,
+  type Notebook,
+} from './domain';
 
-interface StoredState {
-  key: 'main'
-  revision: number
-  state: NotebookState
-}
+type StateRow = {
+  key: 'main';
+  data: Notebook;
+  revision: number;
+};
 
 class BasketDatabase extends Dexie {
-  state!: Table<StoredState, string>
+  state!: Table<StateRow, 'main'>;
 
   constructor() {
-    super('basket-u11')
-    this.version(1).stores({ state: '&key' })
-    this.version(2).stores({ state: '&key' })
+    super('basket-u11');
+    this.version(1).stores({ state: '&key' });
+    this.version(2)
+      .stores({ state: '&key' })
+      .upgrade(async (transaction) => {
+        const table = transaction.table('state');
+        const row = await table.get('main') as Record<string, unknown> | undefined;
+        if (!row) return;
+
+        const source = row.data ?? row.notebook ?? row.value;
+        let data: Notebook;
+        try {
+          data = parseBackup(source);
+        } catch {
+          data = parseBackup({ version: 1, notebook: source });
+        }
+        const revision = typeof row.revision === 'number' && Number.isInteger(row.revision)
+          ? Math.max(0, row.revision)
+          : 0;
+        await table.put({ key: 'main', data, revision });
+      });
   }
 }
 
-const database = new BasketDatabase()
+export const database = new BasketDatabase();
 
 export class RevisionConflictError extends Error {
   constructor() {
-    super('Le carnet a été modifié dans un autre onglet. Rechargez les données avant de continuer.')
-    this.name = 'RevisionConflictError'
+    super('Notebook changed since it was loaded; reload before saving.');
+    this.name = 'RevisionConflictError';
   }
 }
 
-export async function readNotebook(): Promise<{ state: NotebookState; revision: number }> {
+export async function loadState(): Promise<{ data: Notebook; revision: number }> {
   return database.transaction('rw', database.state, async () => {
-    const stored = await database.state.get('main')
-    if (stored) return { state: StateSchema.parse(stored.state), revision: stored.revision }
-    const state = createInitialState()
-    await database.state.put({ key: 'main', revision: 0, state })
-    return { state, revision: 0 }
-  })
+    const row = await database.state.get('main');
+    if (!row) {
+      const data = createInitialNotebook();
+      await database.state.add({ key: 'main', data, revision: 0 });
+      return { data, revision: 0 };
+    }
+    if (!Number.isInteger(row.revision) || row.revision < 0 || !validateNotebook(row.data)) {
+      throw new Error('Stored notebook is invalid');
+    }
+    return { data: row.data, revision: row.revision };
+  });
 }
 
-export async function writeNotebook(
-  state: NotebookState,
+export async function saveState(
+  data: Notebook,
   expectedRevision: number,
-): Promise<number> {
-  const validState = StateSchema.parse(state)
-  return database.transaction('rw', database.state, async () => {
-    const current = await database.state.get('main')
-    if (!current || current.revision !== expectedRevision) throw new RevisionConflictError()
-    const revision = current.revision + 1
-    await database.state.put({ key: 'main', revision, state: validState })
-    return revision
-  })
-}
-
-export async function replaceNotebook(state: NotebookState): Promise<number> {
-  const validState = StateSchema.parse(state)
-  return database.transaction('rw', database.state, async () => {
-    const current = await database.state.get('main')
-    const revision = (current?.revision ?? 0) + 1
-    await database.state.put({ key: 'main', revision, state: validState })
-    return revision
-  })
-}
-
-export async function requestPersistentStorage(): Promise<boolean> {
-  if (!navigator.storage?.persist) {
-    throw new Error('La protection du stockage persistant n’est pas disponible dans ce navigateur.')
+): Promise<{ data: Notebook; revision: number }> {
+  if (!validateNotebook(data)) throw new Error('Notebook is invalid');
+  if (!Number.isInteger(expectedRevision) || expectedRevision < 0) {
+    throw new Error('Expected revision must be a non-negative integer');
   }
-  return navigator.storage.persist()
+  const copy = structuredClone(data);
+
+  return database.transaction('rw', database.state, async () => {
+    const row = await database.state.get('main');
+    const actualRevision = row?.revision ?? 0;
+    if (actualRevision !== expectedRevision) throw new RevisionConflictError();
+
+    const revision = actualRevision + 1;
+    await database.state.put({ key: 'main', data: copy, revision });
+    return { data: structuredClone(copy), revision };
+  });
+}
+
+export async function clearStateForTests(): Promise<void> {
+  await database.transaction('rw', database.state, () => database.state.delete('main'));
 }

@@ -1,354 +1,383 @@
-import { z } from 'zod'
+import { z } from 'zod';
 
-export const PLAYER_COUNT = 14
-export const MATCH_PLAYER_COUNT = 10
-export const PERIOD_COUNT = 8
-export const BACKUP_VERSION = 2
-export const MAX_IMPORT_BYTES = 10 * 1024 * 1024
+export type Player = { id: string; name: string; preferredNumber?: string };
+export type MatchPlayer = { id: string; name: string; number: string };
+export type Action = {
+  id: string;
+  team: 'alm' | 'opponent';
+  kind: 'points' | 'foul';
+  value: 1 | 2;
+  playerId: string | null;
+};
+export type Period = { actions: Action[]; closed: boolean };
+export type Match = {
+  id: string;
+  opponent: string;
+  home: boolean;
+  players: MatchPlayer[];
+  periods: Period[];
+  startedAt: string;
+  finishedAt: string | null;
+};
+export type LegacyTeam = Record<string, unknown>;
+export type Notebook = {
+  roster: Player[];
+  trackFouls: boolean;
+  teams: LegacyTeam[];
+  matches: Match[];
+};
 
-const PlayerSchema = z.object({
-  id: z.string().min(1),
-  name: z.string().trim().min(1),
-}).strict()
+const nonEmptyString = z.string().trim().min(1);
+const isoDate = z.string().refine(
+  (value) => /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})$/.test(value)
+    && !Number.isNaN(Date.parse(value)),
+  'Invalid ISO date',
+);
+export function isJerseyNumber(value: string): boolean {
+  return /^\d{1,3}$/.test(value) && Number(value) >= 1;
+}
 
-const RosterPlayerSchema = PlayerSchema.extend({
-  number: z.string().regex(/^\d{1,3}$/),
-}).strict()
-
-const ScoreActionSchema = z.object({
-  id: z.string().min(1),
+const jerseyNumberSchema = z.string().refine(isJerseyNumber);
+const playerSchema = z.object({
+  id: nonEmptyString,
+  name: nonEmptyString,
+  preferredNumber: jerseyNumberSchema.optional(),
+}).strict();
+const matchPlayerSchema = z.object({
+  id: nonEmptyString,
+  name: nonEmptyString,
+  number: jerseyNumberSchema,
+}).strict();
+const actionSchema = z.object({
+  id: nonEmptyString,
   team: z.enum(['alm', 'opponent']),
-  kind: z.literal('score'),
-  points: z.union([z.literal(1), z.literal(2)]),
+  kind: z.enum(['points', 'foul']),
+  value: z.union([z.literal(1), z.literal(2)]),
   playerId: z.string().min(1).nullable(),
-}).strict()
-
-const FoulActionSchema = z.object({
-  id: z.string().min(1),
-  team: z.literal('alm'),
-  kind: z.literal('foul'),
-  points: z.literal(0),
-  playerId: z.string().min(1),
-}).strict()
-
-const ActionBaseSchema = z.discriminatedUnion('kind', [
-  ScoreActionSchema,
-  FoulActionSchema,
-])
-
-export const ActionSchema = ActionBaseSchema.superRefine((action, context) => {
-  if (action.kind !== 'score') return
-  if (action.team === 'opponent' && action.playerId !== null) {
-    context.addIssue({ code: 'custom', message: 'Une action adverse ne peut pas avoir de joueur.' })
-  }
-  if (action.team === 'alm' && action.playerId === null) {
-    context.addIssue({ code: 'custom', message: 'Une action ALM doit avoir un joueur.' })
-  }
-})
-
-export type MatchAction = z.infer<typeof ActionSchema>
-
-const PeriodSchema = z.object({
-  number: z.number().int().min(1).max(PERIOD_COUNT),
-  actions: z.array(ActionSchema),
+}).strict();
+const periodSchema = z.object({
+  actions: z.array(actionSchema),
   closed: z.boolean(),
-  awardedAlm: z.number().int().min(1).max(3).nullable(),
-  awardedOpponent: z.number().int().min(1).max(3).nullable(),
-}).strict().superRefine((period, context) => {
-  if (period.closed !== (period.awardedAlm !== null && period.awardedOpponent !== null)) {
-    context.addIssue({ code: 'custom', message: 'La clôture de la période et ses points doivent être cohérents.' })
-  }
-})
-
-export const MatchSchema = z.object({
-  id: z.string().min(1),
-  opponent: z.string().trim().min(1),
-  location: z.enum(['home', 'away']),
-  startedAt: z.string().datetime(),
-  completedAt: z.string().datetime().nullable(),
+}).strict();
+const matchSchema = z.object({
+  id: nonEmptyString,
+  opponent: nonEmptyString,
+  home: z.boolean(),
+  players: z.array(matchPlayerSchema).min(6).max(10),
+  periods: z.array(periodSchema).length(8),
+  startedAt: isoDate,
+  finishedAt: isoDate.nullable(),
+}).strict();
+const legacyTeamSchema = z.record(z.string(), z.unknown());
+const notebookSchema = z.object({
+  roster: z.array(playerSchema).length(14),
   trackFouls: z.boolean(),
-  players: z.array(RosterPlayerSchema).length(MATCH_PLAYER_COUNT),
-  periods: z.array(PeriodSchema).length(PERIOD_COUNT),
-}).strict().superRefine((match, context) => {
-  const playerIds = new Set(match.players.map((player) => player.id))
-  const numbers = match.players.map((player) => Number(player.number))
-  if (playerIds.size !== match.players.length) {
-    context.addIssue({ code: 'custom', message: 'Un joueur ne peut apparaître qu’une fois dans la feuille de match.' })
-  }
-  if (new Set(numbers).size !== numbers.length) {
-    context.addIssue({ code: 'custom', message: 'Les numéros du match doivent être uniques.' })
-  }
-  const actionIds = new Set<string>()
-  let foundOpenPeriod = false
-  match.periods.forEach((period, index) => {
-    if (period.number !== index + 1) {
-      context.addIssue({ code: 'custom', message: 'Les périodes doivent être ordonnées de 1 à 8.' })
-    }
-    if (foundOpenPeriod && period.closed) {
-      context.addIssue({ code: 'custom', message: 'Une période ne peut pas être clôturée après une période ouverte.' })
-    }
-    if (!period.closed) foundOpenPeriod = true
-    const score = period.actions.reduce(
-      (total, action) => {
-        if (action.kind === 'score') total[action.team] += action.points
-        return total
-      },
-      { alm: 0, opponent: 0 },
-    )
-    if (period.closed) {
-      const expectedAlm = score.alm > score.opponent ? 3 : score.alm < score.opponent ? 1 : 2
-      const expectedOpponent = score.opponent > score.alm ? 3 : score.opponent < score.alm ? 1 : 2
-      if (period.awardedAlm !== expectedAlm || period.awardedOpponent !== expectedOpponent) {
-        context.addIssue({ code: 'custom', message: 'Les points de match ne correspondent pas au score de la période.' })
+  teams: z.array(legacyTeamSchema),
+  matches: z.array(matchSchema),
+}).strict();
+
+function assertUnique(values: string[], label: string): void {
+  if (new Set(values).size !== values.length) throw new Error(`${label} must be unique`);
+}
+
+function assertNotebookInvariants(notebook: Notebook): void {
+  assertUnique(notebook.roster.map(({ id }) => id), 'Roster player IDs');
+
+  const activeMatches = notebook.matches.filter(({ finishedAt }) => finishedAt === null);
+  if (activeMatches.length > 1) throw new Error('Only one match can be active');
+
+  const matchIds: string[] = [];
+  for (const match of notebook.matches) {
+    matchIds.push(match.id);
+    assertUnique(match.players.map(({ id }) => id), 'Match player IDs');
+    assertUnique(match.players.map(({ number }) => String(Number(number))), 'Match player numbers');
+    const playerIds = new Set(match.players.map(({ id }) => id));
+    const actionIds: string[] = [];
+    let openPeriodSeen = false;
+    let allClosed = true;
+
+    let activePeriodFound = false;
+    match.periods.forEach((period) => {
+      if (period.closed) {
+        if (openPeriodSeen) throw new Error('Closed periods must be consecutive from the start');
+      } else {
+        allClosed = false;
+        openPeriodSeen = true;
+        if (activePeriodFound && period.actions.length > 0) {
+          throw new Error('Only the current period may contain actions');
+        }
+        activePeriodFound = true;
       }
+
+      for (const action of period.actions) {
+        actionIds.push(action.id);
+        if (action.kind === 'foul' && (action.team !== 'alm' || action.playerId === null)) {
+          throw new Error('Fouls must be attributed to an ALM player');
+        }
+        if (action.kind === 'points') {
+          if (action.team === 'alm' && action.playerId === null) {
+            throw new Error('ALM points must be attributed to a player');
+          }
+          if (action.team === 'opponent' && action.playerId !== null) {
+            throw new Error('Opponent points must be anonymous');
+          }
+        }
+        if (action.playerId !== null && !playerIds.has(action.playerId)) {
+          throw new Error('Action player must belong to the match');
+        }
+      }
+    });
+
+    assertUnique(actionIds, 'Action IDs');
+    if (match.finishedAt !== null && !allClosed) {
+      throw new Error('A finished match must have all periods closed');
     }
-    period.actions.forEach((action) => {
-      if (actionIds.has(action.id)) {
-        context.addIssue({ code: 'custom', message: 'Chaque action doit avoir un identifiant unique dans le match.' })
-      }
-      actionIds.add(action.id)
-      if (action.playerId !== null && !playerIds.has(action.playerId)) {
-        context.addIssue({ code: 'custom', message: 'Une action référence un joueur absent du match.' })
-      }
-    })
-  })
-  if (match.completedAt !== null && match.periods.some((period) => !period.closed)) {
-    context.addIssue({ code: 'custom', message: 'Un match terminé doit avoir huit périodes clôturées.' })
   }
-  if (match.completedAt === null && match.periods.every((period) => period.closed)) {
-    context.addIssue({ code: 'custom', message: 'Un match actif doit avoir une période ouverte.' })
-  }
-})
+  assertUnique(matchIds, 'Match IDs');
+}
 
-export const StateSchema = z.object({
-  players: z.array(PlayerSchema).length(PLAYER_COUNT),
-  trackFouls: z.boolean(),
-  activeMatch: MatchSchema.nullable(),
-  matches: z.array(MatchSchema),
-  legacyTeams: z.array(z.unknown()),
-}).strict().superRefine((state, context) => {
-  const playerIds = state.players.map((player) => player.id)
-  if (new Set(playerIds).size !== playerIds.length) {
-    context.addIssue({ code: 'custom', message: 'Les identifiants de l’effectif doivent être uniques.' })
+export function validateNotebook(value: unknown): value is Notebook {
+  try {
+    const notebook = notebookSchema.parse(value);
+    assertNotebookInvariants(notebook);
+    return true;
+  } catch {
+    return false;
   }
-  if (state.matches.some((match) => match.completedAt === null)) {
-    context.addIssue({ code: 'custom', message: 'L’historique ne peut contenir que des matchs terminés.' })
-  }
-  const matchIds = [
-    ...state.matches.map((match) => match.id),
-    ...(state.activeMatch ? [state.activeMatch.id] : []),
-  ]
-  if (new Set(matchIds).size !== matchIds.length) {
-    context.addIssue({ code: 'custom', message: 'Chaque match doit avoir un identifiant unique.' })
-  }
-})
+}
 
-export const BackupSchema = z.object({
-  version: z.literal(BACKUP_VERSION),
-  exportedAt: z.string().datetime(),
-  state: StateSchema,
-}).strict()
+function parseNotebook(value: unknown): Notebook {
+  const notebook = notebookSchema.parse(value);
+  assertNotebookInvariants(notebook);
+  return notebook;
+}
 
-export type Player = z.infer<typeof PlayerSchema>
-export type MatchPlayer = z.infer<typeof RosterPlayerSchema>
-export type Period = z.infer<typeof PeriodSchema>
-export type Match = z.infer<typeof MatchSchema>
-export type NotebookState = z.infer<typeof StateSchema>
+function newId(): string {
+  if (typeof globalThis.crypto?.randomUUID === 'function') return globalThis.crypto.randomUUID();
+  return `id-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+}
 
-export function createInitialState(): NotebookState {
+export function createInitialNotebook(): Notebook {
   return {
-    players: Array.from({ length: PLAYER_COUNT }, (_, index) => ({
-      id: `alm-${index + 1}`,
+    roster: Array.from({ length: 14 }, (_, index) => ({
+      id: `player-${index + 1}`,
       name: `Joueur ${index + 1}`,
     })),
     trackFouls: false,
-    activeMatch: null,
+    teams: [],
     matches: [],
-    legacyTeams: [],
-  }
+  };
 }
 
-export function validateMatchSetup(
-  opponent: string,
-  selected: Array<{ id: string; number: string }>,
-  roster: Player[],
-): string[] {
-  const errors: string[] = []
-  if (!opponent.trim()) errors.push('Le nom de l’équipe adverse est obligatoire.')
-  if (selected.length !== MATCH_PLAYER_COUNT) {
-    errors.push(`Sélectionnez exactement ${MATCH_PLAYER_COUNT} joueurs.`)
-  }
-  if (new Set(selected.map((player) => player.id)).size !== selected.length) {
-    errors.push('Un joueur ne peut être sélectionné qu’une fois.')
-  }
-  const rosterIds = new Set(roster.map((player) => player.id))
-  if (selected.some((player) => !rosterIds.has(player.id))) {
-    errors.push('La sélection contient un joueur absent de l’effectif.')
-  }
-  const numbers = selected.map((player) => player.number.trim())
-  if (numbers.some((number) => !/^\d{1,3}$/.test(number))) {
-    errors.push('Chaque numéro doit comporter de 1 à 3 chiffres.')
-  }
-  if (new Set(numbers.map(Number)).size !== numbers.length) {
-    errors.push('Les numéros de maillot doivent être uniques.')
-  }
-  return errors
+export type Score = { alm: number; opponent: number };
+export type PlayerStats = { points: number; fouls: number };
+
+export function periodScore(period: Period): Score {
+  return period.actions.reduce<Score>((score, action) => {
+    if (action.kind === 'points') score[action.team] += action.value;
+    return score;
+  }, { alm: 0, opponent: 0 });
+}
+
+export function periodPoints(period: Period): Score {
+  const score = periodScore(period);
+  if (score.alm === score.opponent) return { alm: 2, opponent: 2 };
+  return score.alm > score.opponent ? { alm: 3, opponent: 1 } : { alm: 1, opponent: 3 };
+}
+
+export function matchPoints(match: Match): Score {
+  return match.periods.reduce<Score>((total, period) => {
+    if (period.closed) {
+      const points = periodPoints(period);
+      total.alm += points.alm;
+      total.opponent += points.opponent;
+    }
+    return total;
+  }, { alm: 0, opponent: 0 });
+}
+
+export function playerStats(match: Match, playerId: string): PlayerStats {
+  return match.periods.flatMap(({ actions }) => actions).reduce<PlayerStats>((stats, action) => {
+    if (action.playerId === playerId) {
+      if (action.kind === 'points') stats.points += action.value;
+      else stats.fouls += 1;
+    }
+    return stats;
+  }, { points: 0, fouls: 0 });
 }
 
 export function startMatch(
-  state: NotebookState,
+  notebook: Notebook,
   opponent: string,
-  location: Match['location'],
-  selected: Array<{ id: string; number: string }>,
-  now = new Date(),
-): NotebookState {
-  if (state.activeMatch) throw new Error('Un match est déjà en cours.')
-  const errors = validateMatchSetup(opponent, selected, state.players)
-  if (errors.length) throw new Error(errors.join(' '))
-  const players = selected.map((selection) => {
-    const player = state.players.find((candidate) => candidate.id === selection.id)
-    if (!player) throw new Error('Un joueur sélectionné est introuvable.')
-    return { ...player, number: selection.number.trim() }
-  })
-  const periods: Period[] = Array.from({ length: PERIOD_COUNT }, (_, index) => ({
-    number: index + 1,
-    actions: [],
-    closed: false,
-    awardedAlm: null,
-    awardedOpponent: null,
-  }))
-  const activeMatch: Match = {
-    id: crypto.randomUUID(),
-    opponent: opponent.trim(),
-    location,
-    startedAt: now.toISOString(),
-    completedAt: null,
-    trackFouls: state.trackFouls,
-    players,
-    periods,
+  home: boolean,
+  players: MatchPlayer[],
+): Notebook {
+  if (!validateNotebook(notebook)) throw new Error('Invalid notebook');
+  if (activeMatch(notebook)) throw new Error('A match is already active');
+  const cleanOpponent = opponent.trim();
+  if (!cleanOpponent) throw new Error('Opponent name is required');
+  if (players.length < 6 || players.length > 10) throw new Error('A match requires between 6 and 10 players');
+
+  const rosterById = new Map(notebook.roster.map((player) => [player.id, player]));
+  const selectedIds = new Set<string>();
+  const cleanPlayers = players.map((player) => {
+    const rosterPlayer = rosterById.get(player.id);
+    if (!rosterPlayer || selectedIds.has(player.id) || player.name !== rosterPlayer.name) {
+      throw new Error('Match players must be distinct players from the roster');
+    }
+    selectedIds.add(player.id);
+    if (!isJerseyNumber(player.number)) {
+      throw new Error('Player numbers must be between 1 and 999');
+    }
+    return { id: player.id, name: player.name, number: player.number };
+  });
+  assertUnique(cleanPlayers.map(({ number }) => String(Number(number))), 'Match player numbers');
+
+  const match: Match = {
+    id: newId(),
+    opponent: cleanOpponent,
+    home,
+    players: cleanPlayers,
+    periods: Array.from({ length: 8 }, () => ({ actions: [], closed: false })),
+    startedAt: new Date().toISOString(),
+    finishedAt: null,
+  };
+  const result = { ...notebook, matches: [...notebook.matches, match] };
+  if (!validateNotebook(result)) throw new Error('Could not create a valid match');
+  return result;
+}
+
+export function addAction(match: Match, action: Action): Match {
+  if (!validateMatch(match)) throw new Error('Invalid match');
+  if (match.finishedAt !== null) throw new Error('The match is finished');
+  const index = match.periods.findIndex(({ closed }) => !closed);
+  if (index < 0) throw new Error('There is no open period');
+  const parsedAction = actionSchema.parse(action);
+  const playerIds = new Set(match.players.map(({ id }) => id));
+  if (parsedAction.kind === 'foul' && (parsedAction.team !== 'alm' || parsedAction.playerId === null)) {
+    throw new Error('Fouls must be attributed to an ALM player');
   }
-  return { ...state, activeMatch }
-}
-
-export function periodScore(period: Period): { alm: number; opponent: number } {
-  return period.actions.reduce(
-    (score, action) => {
-      if (action.kind === 'score') score[action.team] += action.points
-      return score
-    },
-    { alm: 0, opponent: 0 },
-  )
-}
-
-export function recordAction(
-  state: NotebookState,
-  action: Omit<MatchAction, 'id'>,
-): NotebookState {
-  const match = state.activeMatch
-  if (!match) throw new Error('Aucun match n’est en cours.')
-  const period = match.periods.find((candidate) => !candidate.closed)
-  if (!period) throw new Error('Toutes les périodes sont déjà clôturées.')
-  const parsed = ActionSchema.parse({ ...action, id: crypto.randomUUID() })
-  if (parsed.playerId !== null && !match.players.some((player) => player.id === parsed.playerId)) {
-    throw new Error('Le joueur choisi ne fait pas partie de ce match.')
-  }
-  if (parsed.kind === 'foul' && !match.trackFouls) {
-    throw new Error('Le suivi des fautes est désactivé pour ce match.')
-  }
-  const periods = match.periods.map((candidate) =>
-    candidate.number === period.number
-      ? { ...candidate, actions: [...candidate.actions, parsed] }
-      : candidate,
-  )
-  return { ...state, activeMatch: { ...match, periods } }
-}
-
-export function undoLastAction(state: NotebookState): NotebookState {
-  const match = state.activeMatch
-  if (!match) throw new Error('Aucun match n’est en cours.')
-  const period = match.periods.find((candidate) => !candidate.closed)
-  if (!period || period.actions.length === 0) return state
-  const periods = match.periods.map((candidate) =>
-    candidate.number === period.number
-      ? { ...candidate, actions: candidate.actions.slice(0, -1) }
-      : candidate,
-  )
-  return { ...state, activeMatch: { ...match, periods } }
-}
-
-export function closeCurrentPeriod(state: NotebookState, now = new Date()): NotebookState {
-  const match = state.activeMatch
-  if (!match) throw new Error('Aucun match n’est en cours.')
-  const period = match.periods.find((candidate) => !candidate.closed)
-  if (!period) throw new Error('Toutes les périodes sont déjà clôturées.')
-  const score = periodScore(period)
-  const awardedAlm = score.alm > score.opponent ? 3 : score.alm < score.opponent ? 1 : 2
-  const awardedOpponent = score.opponent > score.alm ? 3 : score.opponent < score.alm ? 1 : 2
-  const periods = match.periods.map((candidate) =>
-    candidate.number === period.number
-      ? { ...candidate, closed: true, awardedAlm, awardedOpponent }
-      : candidate,
-  )
-  const updatedMatch = { ...match, periods }
-  if (periods.every((candidate) => candidate.closed)) {
-    const completedMatch = { ...updatedMatch, completedAt: now.toISOString() }
-    return {
-      ...state,
-      activeMatch: null,
-      matches: [completedMatch, ...state.matches],
+  if (parsedAction.kind === 'points') {
+    if (parsedAction.team === 'alm' && parsedAction.playerId === null) {
+      throw new Error('ALM points must be attributed to a player');
+    }
+    if (parsedAction.team === 'opponent' && parsedAction.playerId !== null) {
+      throw new Error('Opponent points must be anonymous');
     }
   }
-  return { ...state, activeMatch: updatedMatch }
-}
-
-export function matchPoints(match: Match): { alm: number; opponent: number } {
-  return match.periods.reduce(
-    (total, period) => ({
-      alm: total.alm + (period.awardedAlm ?? 0),
-      opponent: total.opponent + (period.awardedOpponent ?? 0),
-    }),
-    { alm: 0, opponent: 0 },
-  )
-}
-
-export function playerStats(match: Match): Array<{ player: MatchPlayer; points: number; fouls: number }> {
-  return match.players.map((player) => {
-    const actions = match.periods.flatMap((period) => period.actions)
-    return {
-      player,
-      points: actions.reduce(
-        (total, action) => total + (action.kind === 'score' && action.playerId === player.id ? action.points : 0),
-        0,
-      ),
-      fouls: actions.reduce(
-        (total, action) => total + (action.kind === 'foul' && action.playerId === player.id ? 1 : 0),
-        0,
-      ),
-    }
-  })
-}
-
-export function parseBackup(text: string): NotebookState {
-  if (new TextEncoder().encode(text).byteLength > MAX_IMPORT_BYTES) {
-    throw new Error('Le fichier dépasse la limite de 10 Mo.')
+  if (parsedAction.playerId !== null && !playerIds.has(parsedAction.playerId)) {
+    throw new Error('Action player must belong to the match');
   }
-  let value: unknown
+  if (match.periods.some((period) => period.actions.some(({ id }) => id === parsedAction.id))) {
+    throw new Error('Action ID must be unique');
+  }
+  const periods = match.periods.map((period, periodIndex) => periodIndex === index
+    ? { ...period, actions: [...period.actions, parsedAction] }
+    : period);
+  return { ...match, periods };
+}
+
+function validateMatch(value: unknown): value is Match {
   try {
-    value = JSON.parse(text)
+    const match = matchSchema.parse(value);
+    const notebook: Notebook = {
+      roster: createInitialNotebook().roster,
+      trackFouls: false,
+      teams: [],
+      matches: [match],
+    };
+    assertNotebookInvariants(notebook);
+    return true;
   } catch {
-    throw new Error('Le fichier ne contient pas un JSON valide.')
+    return false;
   }
-  const parsed = BackupSchema.safeParse(value)
-  if (!parsed.success) {
-    throw new Error(`Sauvegarde invalide : ${parsed.error.issues[0]?.message ?? 'format non reconnu'}`)
-  }
-  return parsed.data.state
 }
 
-export function createBackup(state: NotebookState, now = new Date()): string {
-  return JSON.stringify({
-    version: BACKUP_VERSION,
-    exportedAt: now.toISOString(),
-    state: StateSchema.parse(state),
-  }, null, 2)
+export function undoAction(match: Match): Match {
+  if (!validateMatch(match)) throw new Error('Invalid match');
+  if (match.finishedAt !== null) throw new Error('The match is finished');
+  const index = match.periods.findIndex(({ closed }) => !closed);
+  if (index < 0) throw new Error('There is no open period');
+  const period = match.periods[index];
+  if (period.actions.length === 0) throw new Error('There is no action to undo');
+  const periods = match.periods.map((item, periodIndex) => periodIndex === index
+    ? { ...item, actions: item.actions.slice(0, -1) }
+    : item);
+  return { ...match, periods };
+}
+
+export function closePeriod(match: Match): Match {
+  if (!validateMatch(match)) throw new Error('Invalid match');
+  if (match.finishedAt !== null) throw new Error('The match is already finished');
+  const index = match.periods.findIndex(({ closed }) => !closed);
+  if (index < 0) throw new Error('There is no open period');
+  const periods = match.periods.map((period, periodIndex) => periodIndex === index
+    ? { ...period, closed: true }
+    : period);
+  return { ...match, periods };
+}
+
+export function finishMatch(match: Match): Match {
+  if (!validateMatch(match)) throw new Error('Invalid match');
+  if (match.finishedAt !== null) throw new Error('The match is already finished');
+  if (match.periods.some(({ closed }) => !closed)) throw new Error('All periods must be closed before finishing the match');
+  return { ...match, finishedAt: new Date().toISOString() };
+}
+
+export function activeMatch(notebook: Notebook): Match | null {
+  return notebook.matches.find(({ finishedAt }) => finishedAt === null) ?? null;
+}
+
+function migrateLegacyMatch(value: unknown): Match | null {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
+  const candidate = value as Record<string, unknown>;
+  if (validateMatch(candidate)) return candidate as unknown as Match;
+  return null;
+}
+
+function migrateV1(value: Record<string, unknown>): Notebook {
+  const nested = value.notebook ?? value.data ?? value.state;
+  const raw = (nested && typeof nested === 'object' && !Array.isArray(nested)
+    ? nested
+    : value) as Record<string, unknown>;
+  const initial = createInitialNotebook();
+  if (!Array.isArray(raw.teams) || !Array.isArray(raw.matches)) throw new Error('Invalid legacy notebook');
+  if (raw.roster !== undefined && (!Array.isArray(raw.roster) || raw.roster.length !== 14)) throw new Error('Invalid legacy roster');
+  const roster = raw.roster ?? initial.roster;
+  if (raw.teams !== undefined && !Array.isArray(raw.teams)) throw new Error('Invalid legacy teams');
+  if (raw.matches !== undefined && !Array.isArray(raw.matches)) throw new Error('Invalid legacy matches');
+  const teams = raw.teams ?? [];
+  const matches = (raw.matches ?? []) as unknown[];
+  const migratedMatches = matches.map((match) => {
+    const migrated = migrateLegacyMatch(match);
+    if (!migrated) throw new Error('Unsupported legacy match format; no data was imported');
+    return migrated;
+  });
+  const notebook = {
+    roster,
+    trackFouls: typeof raw.trackFouls === 'boolean' ? raw.trackFouls : false,
+    teams,
+    matches: migratedMatches,
+  };
+  return parseNotebook(notebook);
+}
+
+export function parseBackup(value: unknown): Notebook {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    throw new Error('Backup must be a JSON object');
+  }
+  const backup = value as Record<string, unknown>;
+  if (backup.version === 2) {
+    if (Object.keys(backup).some((key) => key !== 'version' && key !== 'notebook')) throw new Error('Invalid backup fields');
+    return parseNotebook(backup.notebook);
+  }
+  if (backup.version === 1) {
+    return migrateV1(backup);
+  }
+  throw new Error('Unsupported backup version');
+}
+
+export function makeBackup(notebook: Notebook): unknown {
+  if (!validateNotebook(notebook)) throw new Error('Invalid notebook');
+  return { version: 2, notebook: structuredClone(notebook) };
 }

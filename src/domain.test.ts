@@ -1,102 +1,148 @@
-import { describe, expect, it } from 'vitest'
+import { describe, expect, it } from 'vitest';
 import {
-  closeCurrentPeriod,
-  createInitialState,
+  activeMatch,
+  addAction,
+  closePeriod,
+  createInitialNotebook,
+  finishMatch,
+  makeBackup,
   matchPoints,
   parseBackup,
+  periodPoints,
   periodScore,
   playerStats,
-  recordAction,
-  StateSchema,
   startMatch,
-  undoLastAction,
-  validateMatchSetup,
-} from './domain'
+  undoAction,
+  validateNotebook,
+  type Action,
+  type Match,
+  type MatchPlayer,
+} from './domain';
 
-function startedState() {
-  const state = createInitialState()
-  return startMatch(
-    state,
-    'Les Panthères',
-    'home',
-    state.players.slice(0, 10).map((player, index) => ({ id: player.id, number: String(index + 1) })),
-    new Date('2026-01-01T10:00:00.000Z'),
-  )
+function start(notebook = createInitialNotebook()): Match {
+  const players: MatchPlayer[] = notebook.roster.slice(0, 10).map((player, index) => ({
+    ...player,
+    number: String(index + 1),
+  }));
+  return activeMatch(startMatch(notebook, '  Adversaire  ', true, players))!;
 }
 
-describe('match setup', () => {
-  it('rejects duplicate jersey numbers after numeric normalization', () => {
-    const state = createInitialState()
-    const selected = state.players.slice(0, 10).map((player, index) => ({
-      id: player.id,
-      number: index === 1 ? '04' : String(index + 1),
-    }))
-    expect(validateMatchSetup('Adversaire', selected, state.players)).toContain('Les numéros de maillot doivent être uniques.')
-  })
+describe('domain', () => {
+  it('creates a valid initial notebook and snapshots ten players in a match', () => {
+    const notebook = createInitialNotebook();
+    expect(notebook.roster).toHaveLength(14);
+    expect(validateNotebook(notebook)).toBe(true);
 
-  it('requires exactly ten selected players and a non-empty opponent', () => {
-    const state = createInitialState()
-    expect(validateMatchSetup('  ', [], state.players)).toEqual([
-      'Le nom de l’équipe adverse est obligatoire.',
-      'Sélectionnez exactement 10 joueurs.',
-    ])
-  })
-})
+    const next = startMatch(notebook, ' Adversaire ', true, notebook.roster.slice(0, 10)
+      .map((player, index) => ({ ...player, number: String(index + 1) })));
+    expect(notebook.matches).toHaveLength(0);
+    expect(activeMatch(next)?.opponent).toBe('Adversaire');
+    expect(activeMatch(next)?.periods).toHaveLength(8);
+  });
 
-describe('match scoring', () => {
-  it('adds period match points from basket score and resets the next period score', () => {
-    let state = startedState()
-    const playerId = state.activeMatch!.players[0]!.id
-    state = recordAction(state, { team: 'alm', kind: 'score', points: 2, playerId })
-    state = recordAction(state, { team: 'opponent', kind: 'score', points: 1, playerId: null })
-    expect(periodScore(state.activeMatch!.periods[0]!)).toEqual({ alm: 2, opponent: 1 })
-
-    state = closeCurrentPeriod(state, new Date('2026-01-01T10:10:00.000Z'))
-    expect(matchPoints(state.activeMatch!)).toEqual({ alm: 3, opponent: 1 })
-    expect(periodScore(state.activeMatch!.periods[1]!)).toEqual({ alm: 0, opponent: 0 })
-  })
-
-  it('allows a tie and only undoes the last action in the open period', () => {
-    let state = startedState()
-    const playerId = state.activeMatch!.players[0]!.id
-    state = recordAction(state, { team: 'alm', kind: 'score', points: 1, playerId })
-    state = recordAction(state, { team: 'opponent', kind: 'score', points: 1, playerId: null })
-    state = undoLastAction(state)
-    expect(periodScore(state.activeMatch!.periods[0]!)).toEqual({ alm: 1, opponent: 0 })
-    state = closeCurrentPeriod(state)
-    expect(state.activeMatch!.periods[0]!.awardedAlm).toBe(3)
-  })
-
-  it('retains recorded fouls when tracking is turned off', () => {
-    let state = startedState()
-    state = {
-      ...state,
-      trackFouls: true,
-      activeMatch: { ...state.activeMatch!, trackFouls: true },
+  it('accepts between six and ten selected players and rejects counts outside that range', () => {
+    const notebook = createInitialNotebook();
+    for (const count of [6, 10]) {
+      const players = notebook.roster.slice(0, count).map((player, index) => ({
+        ...player,
+        number: String(index + 4),
+      }));
+      expect(activeMatch(startMatch(notebook, 'Adversaire', true, players))?.players).toHaveLength(count);
     }
-    state = recordAction(state, {
-      team: 'alm',
-      kind: 'foul',
-      points: 0,
-      playerId: state.activeMatch!.players[0]!.id,
-    })
-    const match = { ...state.activeMatch!, trackFouls: false }
-    state = { ...state, trackFouls: false, activeMatch: match }
 
-    expect(StateSchema.parse(state).activeMatch?.periods[0]?.actions).toHaveLength(1)
-    expect(playerStats(match)[0]?.fouls).toBe(1)
-  })
+    const tooFew = notebook.roster.slice(0, 5).map((player, index) => ({
+      ...player,
+      number: String(index + 4),
+    }));
+    const tooMany = notebook.roster.slice(0, 11).map((player, index) => ({
+      ...player,
+      number: String(index + 4),
+    }));
+    expect(() => startMatch(notebook, 'Adversaire', true, tooFew)).toThrow(/between 6 and 10/);
+    expect(() => startMatch(notebook, 'Adversaire', true, tooMany)).toThrow(/between 6 and 10/);
+  });
 
-  it('completes the game after eight closed periods and accepts a tied match-point result', () => {
-    let state = startedState()
-    for (let period = 0; period < 8; period += 1) state = closeCurrentPeriod(state)
-    expect(state.activeMatch).toBeNull()
-    expect(state.matches).toHaveLength(1)
-    expect(matchPoints(state.matches[0]!)).toEqual({ alm: 16, opponent: 16 })
-  })
+  it('rejects duplicate numbers even when their strings differ', () => {
+    const notebook = createInitialNotebook();
+    const players = notebook.roster.slice(0, 10).map((player, index) => ({
+      ...player,
+      number: index < 2 ? (index === 0 ? '04' : '4') : String(index + 1),
+    }));
+    expect(() => startMatch(notebook, 'Adversaire', true, players)).toThrow();
+  });
 
-  it('rejects invalid and oversized backups without returning partial state', () => {
-    expect(() => parseBackup('{"version":2}')).toThrow('Sauvegarde invalide')
-    expect(() => parseBackup('x'.repeat(10 * 1024 * 1024 + 1))).toThrow('limite de 10 Mo')
-  })
-})
+  it('allows different players to have the same name', () => {
+    const notebook = createInitialNotebook();
+    notebook.roster[1].name = notebook.roster[0].name;
+    expect(validateNotebook(notebook)).toBe(true);
+    expect(() => startMatch(notebook, 'Adversaire', true, notebook.roster.slice(0, 10)
+      .map((player, index) => ({ ...player, number: String(index + 1) })))).not.toThrow();
+  });
+
+  it('scores points, match points, player stats, and immutable undo correctly', () => {
+    const match = start();
+    const actions: Action[] = [
+      { id: 'a1', team: 'alm', kind: 'points', value: 2, playerId: match.players[0].id },
+      { id: 'a2', team: 'opponent', kind: 'points', value: 1, playerId: null },
+      { id: 'a3', team: 'alm', kind: 'foul', value: 1, playerId: match.players[0].id },
+    ];
+    const withActions = actions.reduce((current, action) => addAction(current, action), match);
+
+    expect(periodScore(withActions.periods[0])).toEqual({ alm: 2, opponent: 1 });
+    expect(playerStats(withActions, match.players[0].id)).toEqual({ points: 2, fouls: 1 });
+    expect(match.periods[0].actions).toHaveLength(0);
+
+    const closed = closePeriod(withActions);
+    expect(periodPoints(closed.periods[0])).toEqual({ alm: 3, opponent: 1 });
+    expect(matchPoints(closed)).toEqual({ alm: 3, opponent: 1 });
+    expect(undoAction(withActions).periods[0].actions).toHaveLength(2);
+    expect(() => undoAction(closed)).toThrow();
+  });
+
+  it('keeps eight closed periods active until the match is explicitly finished', () => {
+    let match = start();
+    expect(() => finishMatch(match)).toThrow(/All periods must be closed/);
+    for (let period = 0; period < 8; period += 1) match = closePeriod(match);
+    expect(match.finishedAt).toBeNull();
+    expect(matchPoints(match)).toEqual({ alm: 16, opponent: 16 });
+    const restored = parseBackup(makeBackup({ ...createInitialNotebook(), matches: [match] }));
+    expect(activeMatch(restored)).toEqual(match);
+    const lateAction: Action = {
+      id: 'late', team: 'opponent', kind: 'points', value: 1, playerId: null,
+    };
+    expect(() => addAction(match, lateAction)).toThrow(/no open period/);
+    expect(() => undoAction(match)).toThrow(/no open period/);
+    expect(() => closePeriod(match)).toThrow(/no open period/);
+    const finished = finishMatch(match);
+    expect(finished.finishedAt).not.toBeNull();
+    expect(finished.periods).toEqual(match.periods);
+    expect(activeMatch({ ...restored, matches: [finished] })).toBeNull();
+    expect(() => addAction(finished, lateAction)).toThrow(/match is finished/);
+  });
+
+  it('round-trips v2 backups and imports v1 while preserving legacy team fields', () => {
+    const notebook = createInitialNotebook();
+    const legacy = { name: 'Équipe historique', customField: { keep: true } };
+    const imported = parseBackup({
+      version: 1,
+      notebook: { ...notebook, teams: [legacy], trackFouls: true },
+    });
+    expect(imported.teams).toEqual([legacy]);
+    expect(imported.trackFouls).toBe(true);
+    expect(parseBackup(makeBackup(imported))).toEqual(imported);
+  });
+
+  it('rejects unknown legacy matches instead of silently losing them', () => {
+    expect(() => parseBackup({ version: 1, notebook: { teams: [], matches: [{ unknown: true }] } })).toThrow();
+  });
+
+  it('round-trips optional preferred numbers and rejects invalid ones in backups', () => {
+    const notebook = createInitialNotebook();
+    notebook.roster[0].preferredNumber = '09';
+    const restored = parseBackup(makeBackup(notebook));
+    expect(restored.roster[0].preferredNumber).toBe('09');
+    expect(restored.roster[1].preferredNumber).toBeUndefined();
+    notebook.roster[0].preferredNumber = '000';
+    expect(() => parseBackup({ version: 2, notebook })).toThrow();
+  });
+});

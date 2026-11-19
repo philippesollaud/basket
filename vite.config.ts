@@ -1,35 +1,29 @@
-import { defineConfig } from 'vite'
-import react from '@vitejs/plugin-react'
-import { VitePWA } from 'vite-plugin-pwa'
+import { defineConfig } from 'vitest/config';
+import react from '@vitejs/plugin-react';
+import { VitePWA } from 'vite-plugin-pwa';
 
 export default defineConfig({
   plugins: [
     react(),
     VitePWA({
       registerType: 'prompt',
-      includeAssets: ['icon.svg'],
+      injectRegister: null,
       manifest: {
-        name: 'Le banc — Basket U11',
+        name: 'Le banc · Basket U11',
         short_name: 'Le banc',
-        description: 'Carnet local de suivi des matchs de basket U11.',
-        lang: 'fr',
-        start_url: '/',
+        description: 'Carnet de match U11 local',
+        theme_color: '#172e4d',
+        background_color: '#f5f2eb',
         display: 'standalone',
-        background_color: '#f5f4ed',
-        theme_color: '#123c35',
+        start_url: '/',
         icons: [
-          {
-            src: '/icon.svg',
-            sizes: 'any',
-            type: 'image/svg+xml',
-            purpose: 'any maskable',
-          },
+          { src: '/icon_192.png', sizes: '192x192', type: 'image/png' },
+          { src: '/icon_512.png', sizes: '512x512', type: 'image/png' },
         ],
       },
-      workbox: {
-        navigateFallback: 'index.html',
-        globPatterns: ['**/*.{js,css,html,svg,woff2}'],
-      },
+      workbox: { globPatterns: ['**/*.{js,css,html,ico,png,svg,woff2}'], navigateFallback: '/index.html' },
     }),
   ],
-})
+  server: { port: 5177, strictPort: true },
+  test: { environment: 'jsdom', setupFiles: ['./src/test-setup.ts'], exclude: ['e2e/**', 'node_modules/**'] },
+});

@@ -5,13 +5,23 @@ import {
   periodPoints, periodScore, playerStats, startMatch, undoAction,
   type Action, type Match, type Notebook, type Player,
 } from './domain';
-import { loadState, RevisionConflictError, saveState } from './storage';
+import { loadBackupHandle, loadState, RevisionConflictError, saveBackupHandle, saveState } from './storage';
+import {
+  backupPermission, backupSnapshot, chooseExistingBackup, chooseNewBackup, fileBackupSupported,
+  readBackup, readBackupOrEmpty, writeBackup,
+} from './file-backup';
 import styles from './App.module.css';
 
 type Screen = 'terrain' | 'effectif' | 'historique' | 'sauvegardes';
 type Loaded = { data: Notebook; revision: number };
 type PendingAction = { kind: 'points' | 'foul'; value: 1 | 2 };
 type PeriodOutcome = 'won' | 'draw' | 'lost' | 'unplayed';
+type BackupStatus =
+  | { kind: 'none' }
+  | { kind: 'permission'; handle: FileSystemFileHandle }
+  | { kind: 'ready'; handle: FileSystemFileHandle; snapshot: string }
+  | { kind: 'conflict'; handle: FileSystemFileHandle; snapshot: string; data: Notebook }
+  | { kind: 'error'; handle: FileSystemFileHandle; detail: string };
 const MAX_FILE_SIZE = 10 * 1024 * 1024;
 const periodOutcomeLabels: Record<PeriodOutcome, string> = {
   won: 'gagnée',
@@ -44,11 +54,44 @@ export default function App() {
   const [error, setError] = useState('');
   const [busy, setBusy] = useState(false);
   const writing = useRef(false);
+  const [backup, setBackup] = useState<BackupStatus>({ kind: 'none' });
+  const backupRef = useRef<BackupStatus>({ kind: 'none' });
   const { needRefresh: [needRefresh], updateServiceWorker } = useRegisterSW();
+
+  function updateBackup(status: BackupStatus) {
+    backupRef.current = status;
+    setBackup(status);
+  }
+
+  async function inspectBackup(handle: FileSystemFileHandle, data: Notebook): Promise<BackupStatus> {
+    if (await backupPermission(handle) !== 'granted') return { kind: 'permission', handle };
+    const file = await readBackup(handle);
+    return file.snapshot === backupSnapshot(data)
+      ? { kind: 'ready', handle, snapshot: file.snapshot }
+      : { kind: 'conflict', handle, ...file };
+  }
 
   useEffect(() => {
     let mounted = true;
-    loadState().then((state) => { if (mounted) setLoaded(state); })
+    loadState().then(async (state) => {
+      let status: BackupStatus = { kind: 'none' };
+      try {
+        const handle = await loadBackupHandle();
+        if (handle) {
+          try {
+            status = await inspectBackup(handle, state.data);
+          } catch (cause) {
+            status = { kind: 'error', handle, detail: message(cause) };
+          }
+        }
+      } catch (cause) {
+        if (mounted) setError(`Impossible de retrouver le fichier de sauvegarde : ${message(cause)}`);
+      }
+      if (mounted) {
+        updateBackup(status);
+        setLoaded(state);
+      }
+    })
       .catch((cause: unknown) => { if (mounted) setError(`Impossible de lire le carnet : ${message(cause)}`); });
     return () => { mounted = false; };
   }, []);
@@ -65,10 +108,130 @@ export default function App() {
     try {
       const saved = await saveState(change(loaded.data), loaded.revision);
       setLoaded(saved);
+      const currentBackup = backupRef.current;
+      if (currentBackup.kind === 'ready') {
+        try {
+          const file = await readBackup(currentBackup.handle);
+          if (file.snapshot !== currentBackup.snapshot) {
+            updateBackup({ kind: 'conflict', handle: currentBackup.handle, ...file });
+          } else {
+            const snapshot = await writeBackup(currentBackup.handle, saved.data);
+            updateBackup({ kind: 'ready', handle: currentBackup.handle, snapshot });
+          }
+        } catch (cause) {
+          updateBackup({ kind: 'error', handle: currentBackup.handle, detail: message(cause) });
+        }
+      }
       return true;
     } catch (cause) {
       setError(message(cause));
       return false;
+    } finally {
+      writing.current = false;
+      setBusy(false);
+    }
+  }
+
+  async function connectBackup(create: boolean) {
+    if (!loaded || writing.current) return;
+    if (create && !window.confirm('Le fichier choisi sera remplacé par le carnet de cet appareil. Continuer ?')) return;
+    writing.current = true;
+    setBusy(true);
+    setError('');
+    let operation = 'Sélection du fichier';
+    try {
+      const handle = create ? await chooseNewBackup() : await chooseExistingBackup();
+      operation = 'Initialisation du fichier';
+      if (create) {
+        const snapshot = await writeBackup(handle, loaded.data);
+        operation = 'Mémorisation du lien vers le fichier';
+        await saveBackupHandle(handle);
+        updateBackup({ kind: 'ready', handle, snapshot });
+      } else {
+        operation = 'Autorisation du fichier';
+        if (await backupPermission(handle, true) !== 'granted') {
+          setError('L’accès au fichier a été refusé. La sauvegarde automatique n’est pas activée.');
+          return;
+        }
+        operation = 'Lecture du fichier existant';
+        const file = await readBackupOrEmpty(handle);
+        let status: BackupStatus;
+        if (!file) {
+          if (!window.confirm(`Le fichier ${handle.name} est vide. Y enregistrer le carnet de cet appareil et activer la sauvegarde automatique ?`)) return;
+          if (await readBackupOrEmpty(handle) !== null) {
+            throw new Error('Le fichier a changé depuis sa lecture. Sélectionnez-le à nouveau.');
+          }
+          operation = 'Initialisation du fichier vide';
+          const snapshot = await writeBackup(handle, loaded.data);
+          status = { kind: 'ready', handle, snapshot };
+        } else {
+          status = file.snapshot === backupSnapshot(loaded.data)
+            ? { kind: 'ready', handle, snapshot: file.snapshot }
+            : { kind: 'conflict', handle, ...file };
+        }
+        operation = 'Mémorisation du lien vers le fichier';
+        await saveBackupHandle(handle);
+        updateBackup(status);
+      }
+    } catch (cause) {
+      if (!(operation === 'Sélection du fichier' && cause instanceof DOMException && cause.name === 'AbortError')) {
+        const detail = operation === 'Sélection du fichier' && cause instanceof DOMException && cause.name === 'InvalidStateError'
+          ? 'Le sélecteur Documents du navigateur a échoué avant de donner accès au fichier. Le carnet local n’a pas été modifié. Utilisez l’export manuel si cette erreur persiste.'
+          : message(cause);
+        setError(`Impossible de configurer la sauvegarde automatique (${operation}) : ${detail}`);
+      }
+    } finally {
+      writing.current = false;
+      setBusy(false);
+    }
+  }
+
+  async function reconnectBackup() {
+    const current = backupRef.current;
+    if (!loaded || current.kind === 'none' || writing.current) return;
+    writing.current = true;
+    setBusy(true);
+    try {
+      if (await backupPermission(current.handle, true) !== 'granted') {
+        updateBackup({ kind: 'permission', handle: current.handle });
+        return;
+      }
+      updateBackup(await inspectBackup(current.handle, loaded.data));
+    } catch (cause) {
+      updateBackup({ kind: 'error', handle: current.handle, detail: message(cause) });
+    } finally {
+      writing.current = false;
+      setBusy(false);
+    }
+  }
+
+  async function resolveBackup(restore: boolean) {
+    const current = backupRef.current;
+    if (!loaded || current.kind !== 'conflict' || writing.current) return;
+    const question = restore
+      ? 'Remplacer le carnet de cet appareil par la sauvegarde ? Le match actif et les réglages seront aussi remplacés.'
+      : 'Remplacer le fichier de sauvegarde par le carnet de cet appareil ?';
+    if (!window.confirm(question)) return;
+    writing.current = true;
+    setBusy(true);
+    setError('');
+    try {
+      const file = await readBackup(current.handle);
+      if (file.snapshot !== current.snapshot) {
+        updateBackup({ kind: 'conflict', handle: current.handle, ...file });
+        setError('Le fichier a changé depuis sa lecture. Vérifiez à nouveau votre choix.');
+        return;
+      }
+      if (restore) {
+        const saved = await saveState(file.data, loaded.revision);
+        setLoaded(saved);
+        updateBackup({ kind: 'ready', handle: current.handle, snapshot: file.snapshot });
+      } else {
+        const snapshot = await writeBackup(current.handle, loaded.data);
+        updateBackup({ kind: 'ready', handle: current.handle, snapshot });
+      }
+    } catch (cause) {
+      setError(`Impossible de résoudre la sauvegarde : ${message(cause)}`);
     } finally {
       writing.current = false;
       setBusy(false);
@@ -91,12 +254,13 @@ export default function App() {
     </header>
     <main className={`${styles.main} ${screen === 'terrain' && match ? styles.mainLive : ''}`}>
       {error && <div className={styles.alert} role="alert">{error}{error.includes('autre onglet') && <button onClick={() => location.reload()}>Recharger</button>}</div>}
+      {backup.kind !== 'none' && backup.kind !== 'ready' && <div className={styles.alert} role="alert">La sauvegarde automatique est en pause. Ouvrez Sauvegardes pour {backup.kind === 'permission' ? 'autoriser l’accès au fichier' : backup.kind === 'conflict' ? 'choisir le carnet à conserver' : 'vérifier le fichier'}.</div>}
       {screen === 'terrain' && (match
         ? <LiveMatch match={match} trackFouls={notebook.trackFouls} busy={busy} update={updateMatch} />
         : <Preparation notebook={notebook} busy={busy} commit={commit} />)}
       {screen === 'effectif' && <Roster notebook={notebook} busy={busy} commit={commit} />}
       {screen === 'historique' && <History notebook={notebook} />}
-      {screen === 'sauvegardes' && <Backups notebook={notebook} busy={busy} commit={commit} setError={setError} />}
+      {screen === 'sauvegardes' && <Backups notebook={notebook} busy={busy} commit={commit} setError={setError} backup={backup} connectBackup={connectBackup} reconnectBackup={reconnectBackup} resolveBackup={resolveBackup} />}
     </main>
     <nav className={styles.nav} aria-label="Navigation principale">
       <div className={styles.navInner}>{tabs.map((tab) => <button key={tab.id} className={screen === tab.id ? styles.navActive : ''} aria-current={screen === tab.id ? 'page' : undefined} onClick={() => { setScreen(tab.id); setError(''); }}><span aria-hidden="true">{tab.icon}</span>{tab.label}</button>)}</div>
@@ -320,7 +484,11 @@ function History({ notebook }: { notebook: Notebook }) {
   </section>;
 }
 
-function Backups({ notebook, busy, commit, setError }: { notebook: Notebook; busy: boolean; commit: Commit; setError: (message: string) => void }) {
+function Backups({ notebook, busy, commit, setError, backup, connectBackup, reconnectBackup, resolveBackup }: {
+  notebook: Notebook; busy: boolean; commit: Commit; setError: (message: string) => void;
+  backup: BackupStatus; connectBackup: (create: boolean) => Promise<void>;
+  reconnectBackup: () => Promise<void>; resolveBackup: (restore: boolean) => Promise<void>;
+}) {
   function exportFile() {
     const blob = new Blob([JSON.stringify(makeBackup(notebook), null, 2)], { type: 'application/json' });
     const url = URL.createObjectURL(blob);
@@ -354,6 +522,22 @@ function Backups({ notebook, busy, commit, setError }: { notebook: Notebook; bus
   }
   return <section><div className={styles.eyebrow}>LE CARNET <span> / </span> SAUVEGARDES</div><div className={styles.pageHeading}><div><h1>À l’abri<span className={styles.dot}>.</span></h1><p>Votre carnet vous appartient. Gardez-en une copie.</p></div></div>
     <div className={styles.infoBox}><strong>Vos données restent ici.</strong><p>Aucun compte, aucun cloud. Si vous changez d’appareil ou effacez les données du navigateur, utilisez une sauvegarde pour retrouver votre carnet.</p></div>
+    <div className={styles.card}><div className={styles.cardTitle}><span className={styles.step}>↻</span><div><h2>Sauvegarde automatique</h2><p>Une copie du carnet est mise à jour dans un fichier choisi sur cet appareil.</p></div></div>
+      {!fileBackupSupported() ? <p>Cette fonction n’est pas disponible dans ce navigateur. Utilisez l’export manuel.</p> : <>
+        {backup.kind === 'none' && <p>Aucun fichier configuré.</p>}
+        {backup.kind === 'ready' && <p>Active : {backup.handle.name}</p>}
+        {backup.kind === 'permission' && <p>Autorisez à nouveau l’accès à {backup.handle.name}.</p>}
+        {backup.kind === 'error' && <p>Impossible d’accéder à {backup.handle.name} : {backup.detail}</p>}
+        {backup.kind === 'conflict' && <p>Le fichier {backup.handle.name} et le carnet de cet appareil sont différents. Choisissez lequel conserver avant de reprendre la sauvegarde.</p>}
+        {(backup.kind === 'permission' || backup.kind === 'error') && <button className={styles.secondary} disabled={busy} onClick={() => void reconnectBackup()}>Vérifier l’accès au fichier</button>}
+        {backup.kind === 'conflict' && <><button className={styles.secondary} disabled={busy} onClick={() => void resolveBackup(true)}>Restaurer le fichier</button><button className={styles.secondary} disabled={busy} onClick={() => void resolveBackup(false)}>Conserver le carnet de cet appareil</button></>}
+        <button className={styles.secondary} disabled={busy} onClick={() => void connectBackup(true)}>Créer un fichier de sauvegarde</button>
+        <button className={styles.secondary} disabled={busy} onClick={() => void connectBackup(false)}>Choisir un fichier existant</button>
+        <p className={styles.smallText}>Sélecteur Documents : la création et l’ouverture utilisent des emplacements mémorisés distincts.</p>
+        <p className={styles.smallText}>Si la création échoue sur Android, choisissez à nouveau le fichier créé. Un fichier vide peut être initialisé après confirmation. Si l’écriture reste impossible, utilisez l’export manuel.</p>
+        <p className={styles.smallText}>Le navigateur peut redemander l’autorisation. Conservez aussi une copie hors du téléphone.</p>
+      </>}
+    </div>
     <div className={styles.card}><div className={styles.cardTitle}><span className={styles.step}>↓</span><div><h2>Exporter le carnet</h2><p>Créez une copie JSON de toutes vos données.</p></div></div><button className={styles.secondary} onClick={exportFile}>Exporter une sauvegarde <span>↗</span></button></div>
     <div className={styles.card}><div className={styles.cardTitle}><span className={styles.step}>↑</span><div><h2>Importer un carnet</h2><p>Restaurez une sauvegarde v1 ou v2 (10 Mo max).</p></div></div><label className={`${styles.secondary} ${styles.fileButton}`}>Choisir un fichier JSON <span>→</span><input type="file" accept=".json,application/json" disabled={busy} onChange={(event) => void importFile(event)} /></label><p className={styles.smallText}>L’import remplace toutes les données après confirmation.</p></div>
     <div className={styles.card}><div className={styles.cardTitle}><span className={styles.step}>◇</span><div><h2>Protéger le stockage</h2><p>Demander au navigateur de conserver les données.</p></div></div><button className={styles.secondary} onClick={() => void persist()}>Demander la protection <span>→</span></button><p className={styles.smallText}>Ce n’est pas une sauvegarde : exportez régulièrement votre carnet.</p></div>

@@ -12,8 +12,14 @@ type StateRow = {
   revision: number;
 };
 
+type BackupRow = {
+  key: 'file';
+  handle: FileSystemFileHandle;
+};
+
 class BasketDatabase extends Dexie {
   state!: Table<StateRow, 'main'>;
+  backup!: Table<BackupRow, 'file'>;
 
   constructor() {
     super('basket-u11');
@@ -37,6 +43,7 @@ class BasketDatabase extends Dexie {
           : 0;
         await table.put({ key: 'main', data, revision });
       });
+    this.version(3).stores({ state: '&key', backup: '&key' });
   }
 }
 
@@ -85,6 +92,17 @@ export async function saveState(
   });
 }
 
+export async function loadBackupHandle(): Promise<FileSystemFileHandle | undefined> {
+  return (await database.backup.get('file'))?.handle;
+}
+
+export async function saveBackupHandle(handle: FileSystemFileHandle): Promise<void> {
+  await database.backup.put({ key: 'file', handle });
+}
+
 export async function clearStateForTests(): Promise<void> {
-  await database.transaction('rw', database.state, () => database.state.delete('main'));
+  await database.transaction('rw', database.state, database.backup, async () => {
+    await database.state.delete('main');
+    await database.backup.delete('file');
+  });
 }

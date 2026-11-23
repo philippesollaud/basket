@@ -70,7 +70,9 @@ joueurs présents dans la feuille de match.
 
 L’écran permet d’exporter les données, d’importer une sauvegarde après
 validation et confirmation explicite, et de demander au navigateur de protéger
-le stockage local contre l’effacement automatique.
+le stockage local contre l’effacement automatique. Sur les navigateurs
+compatibles, il permet également de choisir un fichier de sauvegarde
+automatique et de résoudre les différences entre ce fichier et le carnet local.
 
 ## Règles d’un match
 
@@ -123,12 +125,19 @@ par export puis import manuel. Pour installer l’application ou vérifier le
 mode hors ligne, consultez le
 [guide d’exploitation](./architecture-exploitation.md#mode-hors-ligne-et-mises-à-jour).
 
-L’export JSON comprend l’effectif ALM, les réglages, les matchs terminés et
+L’export JSON et le fichier de sauvegarde automatique comprennent l’effectif
+ALM, les réglages, les matchs terminés et
 actifs ainsi que les sélections et actions correspondantes. L’import remplace
 toutes les données du carnet après confirmation. Les exports sont en v2 et
 les sauvegardes v1 compatibles restent importables. Un fichier invalide, trop
 volumineux ou contenant un format de match non reconnu ne doit modifier aucune
 donnée.
+
+La sauvegarde automatique est mise à jour après chaque modification locale.
+Elle est suspendue si le fichier diffère du carnet local ou si son accès échoue.
+Le navigateur peut demander une nouvelle autorisation. Après effacement des
+données du navigateur, le fichier doit être sélectionné à nouveau. Une copie
+sur le téléphone seul ne protège pas contre la perte de l’appareil.
 
 Effacer les données du navigateur, désinstaller l’application ou perdre
 l’appareil peut supprimer le carnet. L’export régulier est donc nécessaire,
@@ -160,6 +169,9 @@ même si le navigateur accorde la protection du stockage persistant.
   final nul.
 * Une sauvegarde valide restaure les données après confirmation ; une
   sauvegarde invalide est rejetée sans écriture.
+* La sauvegarde automatique conserve le carnet après une modification locale ;
+  une divergence ou une erreur suspend l’écriture dans le fichier sans bloquer
+  l’enregistrement local.
 * Après la mise en cache initiale, l’application et le carnet restent
   utilisables hors ligne.
 * Une mise à jour disponible s’applique sans notification lorsqu’aucun match

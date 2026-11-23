@@ -1,5 +1,55 @@
 import { expect, test } from '@playwright/test';
 
+test('updates a linked backup file and reconnects it after reload', async ({ page }) => {
+  await page.addInitScript(() => {
+    const getHandle = async () => (await navigator.storage.getDirectory())
+      .getFileHandle('test-backup.json', { create: true });
+    Object.defineProperty(window, 'showSaveFilePicker', { value: getHandle });
+    Object.defineProperty(window, 'showOpenFilePicker', { value: async () => [await getHandle()] });
+  });
+  await page.goto('/');
+  await expect(page.getByText('Jour de match')).toBeVisible();
+  await page.getByRole('button', { name: 'Sauvegardes' }).click();
+  page.once('dialog', (dialog) => void dialog.accept());
+  await page.getByRole('button', { name: 'Créer un fichier de sauvegarde' }).click();
+  await expect(page.getByText('Active : test-backup.json')).toBeVisible();
+  await page.getByRole('button', { name: 'Effectif' }).click();
+  await page.getByLabel('Prénom du joueur 1', { exact: true }).fill('Camille');
+  await page.getByRole('button', { name: /Enregistrer l’effectif/ }).click();
+  await expect.poll(async () => page.evaluate(async () => {
+    const handle = await (await navigator.storage.getDirectory()).getFileHandle('test-backup.json');
+    return (await handle.getFile()).text();
+  })).toContain('Camille');
+  await page.reload();
+  await page.getByRole('button', { name: 'Sauvegardes' }).click();
+  await expect(page.getByText('Active : test-backup.json')).toBeVisible();
+});
+
+test('recovers from a stale creation handle by reopening the empty file', async ({ page }) => {
+  await page.addInitScript(() => {
+    const getHandle = async () => (await navigator.storage.getDirectory())
+      .getFileHandle('recovered-backup.json', { create: true });
+    Object.defineProperty(window, 'showSaveFilePicker', { value: async () => {
+      const handle = await getHandle();
+      handle.createWritable = async () => { throw new DOMException('Stale state', 'InvalidStateError'); };
+      return handle;
+    } });
+    Object.defineProperty(window, 'showOpenFilePicker', { value: async () => [await getHandle()] });
+  });
+  await page.goto('/');
+  await expect(page.getByText('Jour de match')).toBeVisible();
+  await page.getByRole('button', { name: 'Sauvegardes' }).click();
+  page.once('dialog', (dialog) => void dialog.accept());
+  await page.getByRole('button', { name: 'Créer un fichier de sauvegarde' }).click();
+  await expect(page.getByRole('alert')).toContainText('Ouverture du fichier en écriture');
+  page.once('dialog', (dialog) => void dialog.accept());
+  await page.getByRole('button', { name: 'Choisir un fichier existant' }).click();
+  await expect(page.getByText('Active : recovered-backup.json')).toBeVisible();
+  await page.reload();
+  await page.getByRole('button', { name: 'Sauvegardes' }).click();
+  await expect(page.getByText('Active : recovered-backup.json')).toBeVisible();
+});
+
 test('records a match, reloads it and retains an eight-period history offline', async ({ page, context }) => {
   await page.goto('/');
   await expect(page.getByText('Jour de match')).toBeVisible();

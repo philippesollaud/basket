@@ -4,6 +4,9 @@ import userEvent from '@testing-library/user-event';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import App from './App';
 import { clearStateForTests, loadState } from './storage';
+import * as storage from './storage';
+import * as fileBackup from './file-backup';
+import { createInitialNotebook, type Notebook } from './domain';
 
 vi.mock('virtual:pwa-register/react', () => ({
   useRegisterSW: () => ({ needRefresh: [false, vi.fn()], updateServiceWorker: vi.fn() }),
@@ -50,6 +53,198 @@ describe('coach workflow', () => {
     vi.spyOn(window, 'confirm').mockReturnValue(false);
     await user.click(screen.getByRole('button', { name: /clôturer la période/i }));
     expect((await loadState()).data.matches[0].periods[0].closed).toBe(false);
+  });
+
+  describe('automatic file backup', () => {
+    const handle = { name: 'carnet.json' } as FileSystemFileHandle;
+    let file: Notebook;
+    let linked: FileSystemFileHandle | undefined;
+    let permission: 'granted' | 'prompt';
+    let empty: boolean;
+
+    beforeEach(async () => {
+      await clearStateForTests();
+      file = createInitialNotebook();
+      linked = undefined;
+      permission = 'granted';
+      empty = false;
+      vi.spyOn(fileBackup, 'fileBackupSupported').mockReturnValue(true);
+      vi.spyOn(fileBackup, 'chooseNewBackup').mockResolvedValue(handle);
+      vi.spyOn(fileBackup, 'chooseExistingBackup').mockResolvedValue(handle);
+      vi.spyOn(fileBackup, 'backupPermission').mockImplementation(async () => permission);
+      vi.spyOn(fileBackup, 'readBackup').mockImplementation(async () => ({
+        data: structuredClone(file), snapshot: fileBackup.backupSnapshot(file),
+      }));
+      vi.spyOn(fileBackup, 'readBackupOrEmpty').mockImplementation(async () => empty ? null : ({
+        data: structuredClone(file), snapshot: fileBackup.backupSnapshot(file),
+      }));
+      vi.spyOn(fileBackup, 'writeBackup').mockImplementation(async (_handle, data) => {
+        file = structuredClone(data);
+        empty = false;
+        return fileBackup.backupSnapshot(file);
+      });
+      vi.spyOn(storage, 'loadBackupHandle').mockImplementation(async () => linked);
+      vi.spyOn(storage, 'saveBackupHandle').mockImplementation(async (value) => { linked = value; });
+      vi.spyOn(window, 'confirm').mockReturnValue(true);
+    });
+    afterEach(() => { cleanup(); vi.restoreAllMocks(); });
+
+    it('reports a picker failure without linking or writing a file', async () => {
+      vi.mocked(fileBackup.chooseExistingBackup).mockRejectedValueOnce(
+        new DOMException('Stale location', 'InvalidStateError'),
+      );
+      const user = userEvent.setup();
+      render(<App />);
+      await screen.findByText('Jour de match');
+      const before = await loadState();
+      await user.click(screen.getByRole('button', { name: 'Sauvegardes' }));
+      await user.click(screen.getByRole('button', { name: 'Choisir un fichier existant' }));
+      expect(await screen.findByRole('alert')).toHaveTextContent('sélecteur Documents');
+      expect(fileBackup.writeBackup).not.toHaveBeenCalled();
+      expect(linked).toBeUndefined();
+      expect(await loadState()).toEqual(before);
+    });
+
+    it('can reopen and initialize an empty file after a stale-handle creation failure', async () => {
+      empty = true;
+      vi.mocked(fileBackup.writeBackup).mockRejectedValueOnce(new fileBackup.BackupFileError(
+        'Ouverture du fichier en écriture', new DOMException('Stale state', 'InvalidStateError'),
+      ));
+      const user = userEvent.setup();
+      render(<App />);
+      await screen.findByText('Jour de match');
+      await user.click(screen.getByRole('button', { name: 'Sauvegardes' }));
+      await user.click(screen.getByRole('button', { name: 'Créer un fichier de sauvegarde' }));
+      expect(await screen.findByRole('alert')).toHaveTextContent('Ouverture du fichier en écriture');
+      expect(screen.getByRole('alert')).toHaveTextContent('Choisir un fichier existant');
+      expect(linked).toBeUndefined();
+      await user.click(screen.getByRole('button', { name: 'Choisir un fichier existant' }));
+      await screen.findByText('Active : carnet.json');
+      expect(linked).toBe(handle);
+      expect(empty).toBe(false);
+      expect(file).toEqual((await loadState()).data);
+    });
+
+    it('does not initialize an empty file without confirmation or accept an invalid file', async () => {
+      empty = true;
+      vi.mocked(window.confirm).mockReturnValue(false);
+      const user = userEvent.setup();
+      render(<App />);
+      await screen.findByText('Jour de match');
+      await user.click(screen.getByRole('button', { name: 'Sauvegardes' }));
+      await user.click(screen.getByRole('button', { name: 'Choisir un fichier existant' }));
+      expect(fileBackup.writeBackup).not.toHaveBeenCalled();
+      expect(linked).toBeUndefined();
+      vi.mocked(fileBackup.readBackupOrEmpty).mockRejectedValueOnce(new Error('Fichier invalide'));
+      await user.click(screen.getByRole('button', { name: 'Choisir un fichier existant' }));
+      expect(await screen.findByRole('alert')).toHaveTextContent('Fichier invalide');
+      expect(fileBackup.writeBackup).not.toHaveBeenCalled();
+      expect(linked).toBeUndefined();
+    });
+
+    it('updates the chosen file after saving and reconnects on reload', async () => {
+      const user = userEvent.setup();
+      const view = render(<App />);
+      await screen.findByText('Jour de match');
+      await user.click(screen.getByRole('button', { name: 'Sauvegardes' }));
+      await user.click(screen.getByRole('button', { name: 'Créer un fichier de sauvegarde' }));
+      await screen.findByText('Active : carnet.json');
+      await user.click(screen.getByRole('button', { name: 'Effectif' }));
+      const name = screen.getByLabelText('Prénom du joueur 1');
+      await user.clear(name);
+      await user.type(name, 'Camille');
+      await user.click(screen.getByRole('button', { name: /enregistrer l’effectif/i }));
+      await waitFor(() => expect(file.roster[0].name).toBe('Camille'));
+      view.unmount();
+      render(<App />);
+      await screen.findByText('Jour de match');
+      await user.click(screen.getByRole('button', { name: 'Sauvegardes' }));
+      expect(await screen.findByText('Active : carnet.json')).toBeInTheDocument();
+    });
+
+    it('offers to restore an existing file without overwriting local data', async () => {
+      file.roster[0].name = 'Camille';
+      const user = userEvent.setup();
+      render(<App />);
+      await screen.findByText('Jour de match');
+      await user.click(screen.getByRole('button', { name: 'Sauvegardes' }));
+      await user.click(screen.getByRole('button', { name: 'Choisir un fichier existant' }));
+      await screen.findByText(/sont différents/);
+      expect((await loadState()).data.roster[0].name).toBe('Joueur 1');
+      expect(file.roster[0].name).toBe('Camille');
+      await user.click(screen.getByRole('button', { name: 'Restaurer le fichier' }));
+      await screen.findByText('Active : carnet.json');
+      expect((await loadState()).data.roster[0].name).toBe('Camille');
+    });
+
+    it('pauses on missing permission and reconciles changes after access is restored', async () => {
+      linked = handle;
+      permission = 'prompt';
+      const user = userEvent.setup();
+      render(<App />);
+      await screen.findByText(/sauvegarde automatique est en pause/);
+      await user.click(screen.getByRole('button', { name: 'Effectif' }));
+      const name = screen.getByLabelText('Prénom du joueur 1');
+      await user.clear(name);
+      await user.type(name, 'Camille');
+      await user.click(screen.getByRole('button', { name: /enregistrer l’effectif/i }));
+      await waitFor(async () => expect((await loadState()).data.roster[0].name).toBe('Camille'));
+      expect(file.roster[0].name).toBe('Joueur 1');
+      permission = 'granted';
+      await user.click(screen.getByRole('button', { name: 'Sauvegardes' }));
+      await user.click(screen.getByRole('button', { name: 'Vérifier l’accès au fichier' }));
+      await screen.findByText(/sont différents/);
+      await user.click(screen.getByRole('button', { name: 'Conserver le carnet de cet appareil' }));
+      await screen.findByText('Active : carnet.json');
+      expect(file.roster[0].name).toBe('Camille');
+    });
+
+    it('pauses instead of overwriting an externally modified file', async () => {
+      linked = handle;
+      const user = userEvent.setup();
+      render(<App />);
+      await screen.findByText('Jour de match');
+      file.roster[0].name = 'Alex';
+      await user.click(screen.getByRole('button', { name: 'Effectif' }));
+      const name = screen.getByLabelText('Prénom du joueur 1');
+      await user.clear(name);
+      await user.type(name, 'Camille');
+      await user.click(screen.getByRole('button', { name: /enregistrer l’effectif/i }));
+      await screen.findByText(/sauvegarde automatique est en pause/);
+      expect(file.roster[0].name).toBe('Alex');
+      expect((await loadState()).data.roster[0].name).toBe('Camille');
+    });
+
+    it('keeps the local change and reports a failed file write', async () => {
+      linked = handle;
+      vi.spyOn(fileBackup, 'writeBackup').mockRejectedValue(new Error('Disque plein'));
+      const user = userEvent.setup();
+      render(<App />);
+      await screen.findByText('Jour de match');
+      await user.click(screen.getByRole('button', { name: 'Effectif' }));
+      await user.click(screen.getByLabelText('Suivi des fautes'));
+      await screen.findByText(/sauvegarde automatique est en pause/);
+      expect((await loadState()).data.trackFouls).toBe(true);
+      expect(file.trackFouls).toBe(false);
+      await user.click(screen.getByRole('button', { name: 'Sauvegardes' }));
+      expect(screen.getByText(/Disque plein/)).toBeInTheDocument();
+    });
+
+    it('asks again if the file changes before a conflict is resolved', async () => {
+      file.roster[0].name = 'Alex';
+      linked = handle;
+      const user = userEvent.setup();
+      render(<App />);
+      await screen.findByText(/sauvegarde automatique est en pause/);
+      await user.click(screen.getByRole('button', { name: 'Sauvegardes' }));
+      file.roster[0].name = 'Camille';
+      await user.click(screen.getByRole('button', { name: 'Restaurer le fichier' }));
+      await screen.findByText(/Le fichier a changé depuis sa lecture/);
+      expect((await loadState()).data.roster[0].name).toBe('Joueur 1');
+      await user.click(screen.getByRole('button', { name: 'Restaurer le fichier' }));
+      await screen.findByText('Active : carnet.json');
+      expect((await loadState()).data.roster[0].name).toBe('Camille');
+    });
   });
 
   it('requires six players and can start with six selected players', async () => {
